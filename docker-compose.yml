@@ -1,0 +1,11 @@
+services:
+  systemc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: systemc_sensor_fusion
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    stdin_open: true
+    tty: true
