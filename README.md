@@ -53,7 +53,7 @@ The container installs the build toolchain and builds SystemC inside the image.
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/SaulDurazoM/Sensor-Fusion-in-SystemC.git
 cd sensor_fusion_systemc
 ```
 
