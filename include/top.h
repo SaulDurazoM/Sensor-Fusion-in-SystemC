@@ -1,121 +1,182 @@
 #pragma once
 
+#include <fstream>
+#include <random>
 #include <systemc>
 
-#include "config.h"
-#include "telemetry.h"
+#include <Eigen/Dense>
+
+#include "physics_config.h"
+#include "sim_config.h"
 #include "types.h"
 
-SC_MODULE(IMUSource) {
+// ─────────────────────────────────────────────────────────────────────────────
+// IMUSensor  — 1 kHz, reads shared PlantState, adds Gaussian noise
+// ─────────────────────────────────────────────────────────────────────────────
+SC_MODULE(IMUSensor) {
 public:
     sc_core::sc_fifo_out<IMUSample> out;
 
-    SC_HAS_PROCESS(IMUSource);
-
-    IMUSource(sc_core::sc_module_name name, const Config& cfg, Telemetry& telemetry);
-
+    SC_HAS_PROCESS(IMUSensor);
+    IMUSensor(sc_core::sc_module_name name,
+              const SimConfig& scfg, const PhysicsConfig& pcfg,
+              const PlantState* state);
     void run();
 
 private:
-    Config cfg_;
-    Telemetry& telemetry_;
+    SimConfig     scfg_;
+    PhysicsConfig pcfg_;
+    const PlantState* state_;
     std::uint64_t seq_ = 0;
-
-    bool in_burst_window(const sc_core::sc_time& now) const;
+    std::mt19937  rng_{ 42 };
+    std::normal_distribution<double> gyro_noise_;
+    std::normal_distribution<double> accel_noise_;
+    std::normal_distribution<double> compute_dist_;
 };
 
-SC_MODULE(GPSSource) {
+// ─────────────────────────────────────────────────────────────────────────────
+// EncoderSensor  — 100 Hz, quantises cart position to encoder_resolution
+// ─────────────────────────────────────────────────────────────────────────────
+SC_MODULE(EncoderSensor) {
 public:
-    sc_core::sc_fifo_out<GPSSample> out;
+    sc_core::sc_fifo_out<EncoderSample> out;
 
-    SC_HAS_PROCESS(GPSSource);
-
-    GPSSource(sc_core::sc_module_name name, const Config& cfg, Telemetry& telemetry);
-
+    SC_HAS_PROCESS(EncoderSensor);
+    EncoderSensor(sc_core::sc_module_name name,
+                  const SimConfig& scfg, const PlantState* state);
     void run();
 
 private:
-    Config cfg_;
-    Telemetry& telemetry_;
+    SimConfig     scfg_;
+    const PlantState* state_;
     std::uint64_t seq_ = 0;
-
-    bool in_burst_window(const sc_core::sc_time& now) const;
+    std::mt19937  rng_{ 99 };
+    std::normal_distribution<double> compute_dist_;
 };
 
-SC_MODULE(Fusion) {
+// ─────────────────────────────────────────────────────────────────────────────
+// FusionControl  — complementary filter + dual PID, runs at control_period
+// ─────────────────────────────────────────────────────────────────────────────
+SC_MODULE(FusionControl) {
 public:
-    sc_core::sc_fifo_in<IMUSample> imu_in;
-    sc_core::sc_fifo_in<GPSSample> gps_in;
-    sc_core::sc_fifo_out<FusionState> out;
-
-    SC_HAS_PROCESS(Fusion);
-
-    Fusion(sc_core::sc_module_name name, const Config& cfg, Telemetry& telemetry);
-
-    void run();
-
-private:
-    Config cfg_;
-    Telemetry& telemetry_;
-
-    std::uint64_t seq_ = 0;
-    IMUSample last_imu_;
-    GPSSample last_gps_;
-    bool have_imu_ = false;
-    bool have_gps_ = false;
-};
-
-SC_MODULE(Control) {
-public:
-    sc_core::sc_fifo_in<FusionState> in;
+    sc_core::sc_fifo_in<IMUSample>       imu_in;
+    sc_core::sc_fifo_in<EncoderSample>   enc_in;
     sc_core::sc_fifo_out<ControlCommand> out;
 
-    SC_HAS_PROCESS(Control);
-
-    Control(sc_core::sc_module_name name, const Config& cfg, Telemetry& telemetry);
-
+    SC_HAS_PROCESS(FusionControl);
+    FusionControl(sc_core::sc_module_name name,
+                  const SimConfig& scfg, const PhysicsConfig& pcfg);
     void run();
 
 private:
-    Config cfg_;
-    Telemetry& telemetry_;
+    SimConfig     scfg_;
+    PhysicsConfig pcfg_;
     std::uint64_t seq_ = 0;
+    std::mt19937  rng_{ 7 };
+    std::normal_distribution<double> compute_normal_dist_;
+    std::normal_distribution<double> compute_disturbed_dist_;
+
+    // Latest sensor readings — persist across ticks so filter always has data
+    IMUSample     last_imu_;
+    EncoderSample last_enc_;
+
+    // Complementary filter state
+    double theta_est_     = 0.0;
+    double theta_dot_est_ = 0.0;
+    double theta_ddot_est_ = 0.0;  // estimated from omega derivative; used next tick for bias removal
+    double z_est_         = 0.0;
+    double z_dot_est_     = 0.0;
+    double z_ddot_est_    = 0.0;   // stored each tick for next tick's theta bias removal
+
+    // PID integrators
+    double int_theta_ = 0.0;
+    double int_z_     = 0.0;
+
+    bool             first_tick_ = true;
+    sc_core::sc_time last_time_  = sc_core::SC_ZERO_TIME;
+
+    double clamp(double v, double limit) const;
+    double wrap_angle(double a) const;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Plant  — nonlinear RK4 integrator; exposes PlantState* for sensors
+//
+// NOTE: Plant must be declared (and thus constructed) before IMUSensor and
+//       EncoderSensor in Top so that get_state() is valid when sensors init.
+// ─────────────────────────────────────────────────────────────────────────────
 SC_MODULE(Plant) {
 public:
-    sc_core::sc_fifo_in<ControlCommand> in;
+    sc_core::sc_fifo_in<ControlCommand>    control_in;
+    sc_core::sc_fifo_in<DisturbanceTorque> disturbance_in;
 
     SC_HAS_PROCESS(Plant);
+    Plant(sc_core::sc_module_name name,
+          const SimConfig& scfg, const PhysicsConfig& pcfg);
+    ~Plant();
 
-    Plant(sc_core::sc_module_name name, const Config& cfg, Telemetry& telemetry);
+    const PlantState* get_state() const { return &state_; }
 
     void run();
 
 private:
-    Config cfg_;
-    Telemetry& telemetry_;
+    SimConfig     scfg_;
+    PhysicsConfig pcfg_;
+    std::mt19937  rng_{ 13 };
+    std::normal_distribution<double> compute_dist_;
 
-    double x_ = 0.0;
-    double y_ = 0.0;
-    double heading_ = 0.0;
+    PlantState state_;
+    double current_force_ = 0.0;
+
+    std::ofstream csv_;
+
+    using Vec4 = Eigen::Vector4d;
+    Vec4 dynamics(const Vec4& x, double F, double tau_d) const;
+    Vec4 rk4_step(const Vec4& x, double F, double tau_d, double dt) const;
+
+    void write_csv_header();
+    void write_csv_row(double t);
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Disturbance  — fires scheduled torque impulses into the disturbance FIFO
+// ─────────────────────────────────────────────────────────────────────────────
+SC_MODULE(Disturbance) {
+public:
+    sc_core::sc_fifo_out<DisturbanceTorque> out;
+
+    SC_HAS_PROCESS(Disturbance);
+    Disturbance(sc_core::sc_module_name name,
+                const SimConfig& scfg, const PhysicsConfig& pcfg);
+    void run();
+
+private:
+    SimConfig     scfg_;
+    PhysicsConfig pcfg_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Top  — owns all FIFOs and modules; wires everything in constructor
+//
+// Member declaration order matters: Plant must come before IMUSensor/Encoder
+// so its constructor (and therefore get_state()) runs first.
+// ─────────────────────────────────────────────────────────────────────────────
 SC_MODULE(Top) {
 public:
-    Config cfg;
-    Telemetry telemetry;
+    SimConfig     scfg;
+    PhysicsConfig pcfg;
 
-    sc_core::sc_fifo<IMUSample> imu_fifo;
-    sc_core::sc_fifo<GPSSample> gps_fifo;
-    sc_core::sc_fifo<FusionState> fusion_fifo;
-    sc_core::sc_fifo<ControlCommand> control_fifo;
+    sc_core::sc_fifo<IMUSample>         imu_fifo;
+    sc_core::sc_fifo<EncoderSample>     enc_fifo;
+    sc_core::sc_fifo<ControlCommand>    control_fifo;
+    sc_core::sc_fifo<DisturbanceTorque> disturbance_fifo;
 
-    IMUSource imu;
-    GPSSource gps;
-    Fusion fusion;
-    Control control;
-    Plant plant;
+    Plant         plant;        // constructed first — sensors need get_state()
+    IMUSensor     imu;
+    EncoderSensor encoder;
+    FusionControl fusion_ctrl;
+    Disturbance   disturbance;
 
-    Top(sc_core::sc_module_name name, const Config& config);
+    Top(sc_core::sc_module_name name,
+        const SimConfig& s, const PhysicsConfig& p);
 };
