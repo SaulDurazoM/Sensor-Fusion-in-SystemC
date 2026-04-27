@@ -33,11 +33,10 @@ struct SimConfig {
     // θ_setpoint = Kp_z·z + Ki_z·∫z + Kd_z·ż, clamped to ±theta_setpoint_clamp.
     // Positive z (cart right) → positive θ_setpoint (lean left) → net leftward force.
     double Kp_z                 = 0.05;    // rad/m
-    double Ki_z                 = 0.001;   // rad/(m·s)
-    double Kd_z                 = 0.02;    // rad·s/m
+    double Ki_z                 = 0.005;   // rad/(m·s)
+    double Kd_z                 = 0.05;    // rad·s/m
     double integrator_clamp_z   = 5.0;   // m·s  (raw integral safety clamp)
-    //double theta_setpoint_clamp = 0.25;   // rad  (~14°, hard limit on angle bias)
-    double theta_setpoint_clamp = 0.01;
+    double theta_setpoint_clamp = 0.25;   // rad  (~14°, hard limit on angle bias)
 
     // Asymmetric decay on the z integrator accumulator:
     //   - when the new increment opposes the accumulator (unwinding), scale by

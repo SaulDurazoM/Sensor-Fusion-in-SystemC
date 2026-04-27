@@ -57,6 +57,7 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 // FusionControl  — complementary filter + dual PID, runs at control_period
 // ─────────────────────────────────────────────────────────────────────────────
+#define USE_FULL_STATE true
 SC_MODULE(FusionControl) {
 public:
     sc_core::sc_fifo_in<IMUSample>       imu_in;
@@ -65,7 +66,7 @@ public:
 
     SC_HAS_PROCESS(FusionControl);
     FusionControl(sc_core::sc_module_name name,
-                  const SimConfig& scfg, const PhysicsConfig& pcfg);
+                  const SimConfig& scfg, const PhysicsConfig& pcfg , const PlantState* state);
     void run();
 
 private:
@@ -82,6 +83,9 @@ private:
     EncoderSample last_enc_prev_;  // previous encoder sample for z_dot finite difference
 
     double last_cmd_force_ = 0.0;  // force from previous tick; used for model-based θ̈
+
+    //Alternatively use purely the full state feedback to calculate commands (used for PID constant verification)
+    const PlantState* state_; //used when USE_FULL_STATE = true
 
     // Complementary filter state
     double theta_est_     = 0.0;
