@@ -79,11 +79,14 @@ private:
     // Latest sensor readings — persist across ticks so filter always has data
     IMUSample     last_imu_;
     EncoderSample last_enc_;
+    EncoderSample last_enc_prev_;  // previous encoder sample for z_dot finite difference
+
+    double last_cmd_force_ = 0.0;  // force from previous tick; used for model-based θ̈
 
     // Complementary filter state
     double theta_est_     = 0.0;
     double theta_dot_est_ = 0.0;
-    double theta_ddot_est_ = 0.0;  // estimated from omega derivative; used next tick for bias removal
+    double theta_ddot_est_ = 0.0;  // model-based (EOM solve); used next tick for accel bias removal
     double z_est_         = 0.0;
     double z_dot_est_     = 0.0;
     double z_ddot_est_    = 0.0;   // stored each tick for next tick's theta bias removal
@@ -94,6 +97,8 @@ private:
 
     bool             first_tick_ = true;
     sc_core::sc_time last_time_  = sc_core::SC_ZERO_TIME;
+
+    std::ofstream ctrl_csv_;
 
     double clamp(double v, double limit) const;
     double wrap_angle(double a) const;

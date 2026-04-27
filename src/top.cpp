@@ -107,6 +107,18 @@ FusionControl::FusionControl(sc_module_name name,
       compute_normal_dist_  (scfg.fc_compute_mean_us,   scfg.fc_compute_std_us),
       compute_disturbed_dist_(scfg.fc_disturbed_mean_us, scfg.fc_disturbed_std_us)
 {
+    const std::string dir  = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/control.csv";
+    std::filesystem::create_directories(dir);
+    ctrl_csv_.open(path);
+    if (!ctrl_csv_.is_open())
+        SC_REPORT_FATAL("FusionControl", ("Cannot open control CSV: " + path).c_str());
+    ctrl_csv_ << "time_s,"
+              << "theta_est,theta_dot_est,theta_ddot_est,"
+              << "z_est,z_dot_est,z_ddot_est,"
+              << "outer_P,outer_I,outer_D,theta_setpoint_raw,theta_setpoint,"
+              << "e_theta,inner_P,inner_I,inner_D,force_raw,force\n";
+
     SC_THREAD(run);
 }
 
@@ -154,44 +166,83 @@ void FusionControl::run() {
             continue;
         }
 
+        // ── Model-based θ̈: solve 2×2 EOM with known control force ──────────
+        // Using finite-diff of gyro (raw_theta_ddot ≈ 7 rad/s² noise after LP ≈1.1 rad/s²)
+        // is worse than the signal-to-noise of z̈ (~0.08 m/s²), so we instead solve
+        // the Lagrangian mass matrix system directly given last_cmd_force_ and state.
+        // tau_d is unknown; we assume 0 (a disturbance estimator could refine this).
+        const double alpha_ddot = scfg_.tau_ddot / (scfg_.tau_ddot + dt);
+        {
+            const double th  = theta_est_;
+            const double thd = theta_dot_est_;
+            const double mc  = pcfg_.m_c, mp = pcfg_.m_p;
+            const double L   = pcfg_.L,   g  = pcfg_.g;
+            const double Ip  = pcfg_.I_pivot();
+            const double f_fric = pcfg_.mu * (mc + mp) * g
+                                * std::tanh(z_dot_est_ / 0.001);
+
+            Eigen::Matrix2d M;
+            M(0,0) = mc + mp;
+            M(0,1) = -0.5 * mp * L * std::cos(th);
+            M(1,0) = M(0,1);
+            M(1,1) = Ip;
+
+            Eigen::Vector2d fvec;
+            fvec[0] = last_cmd_force_ - f_fric
+                    - 0.5 * mp * L * thd * thd * std::sin(th);
+            fvec[1] = mp * g * (L / 2.0) * std::sin(th);
+
+            const Eigen::Vector2d accel = M.ldlt().solve(fvec);
+            theta_ddot_est_ = alpha_ddot * theta_ddot_est_
+                            + (1.0 - alpha_ddot) * accel[1];
+        }
+
         // ── Complementary filter: θ ───────────────────────────────────────
         // Remove previous-tick dynamic bias from both axes, then use atan2.
-        // atan2 is self-normalising (g cancels in the ratio) and has uniform
-        // noise σ_a/g vs asin's σ_a/(g·cosθ) which blows up off-vertical.
-        //   a_x' = −L·θ̈ + g·sinθ + z̈·cosθ  →  corrected ≈ g·sinθ
-        //   a_y' = −L·θ̇² + g·cosθ − z̈·sinθ  →  corrected ≈ g·cosθ
         const double a_x_corrected = last_imu_.a_x_prime
-            + pcfg_.L * theta_ddot_est_
-            - z_ddot_est_ * std::cos(theta_est_);
+             + pcfg_.L * theta_ddot_est_
+             - z_ddot_est_ * std::cos(theta_est_);
 
         const double a_y_corrected = last_imu_.a_y_prime
-            + pcfg_.L * theta_dot_est_ * theta_dot_est_   // cancel −L·θ̇²
-            + z_ddot_est_ * std::sin(theta_est_);         // cancel −z̈·sinθ
+             + pcfg_.L * theta_dot_est_ * theta_dot_est_
+             + z_ddot_est_ * std::sin(theta_est_);
 
         const double theta_from_accel = std::atan2(a_x_corrected, a_y_corrected);
 
-        // Update θ̈ estimate before overwriting theta_dot_est_ (need old value to diff)
-        theta_ddot_est_ = (last_imu_.omega - theta_dot_est_) / dt;
-
-        // alpha derived from time constant each tick so bandwidth is dt-invariant
         const double alpha_theta = scfg_.tau_theta / (scfg_.tau_theta + dt);
         theta_est_     = alpha_theta * (theta_est_ + last_imu_.omega * dt)
                        + (1.0 - alpha_theta) * theta_from_accel;
         theta_dot_est_ = last_imu_.omega;
 
         // ── Complementary filter: z ───────────────────────────────────────
-        // Full rearrangement: a_x' = −L·θ̈ + g·sinθ + z̈·cosθ
-        //   → z̈ = (a_x' + L·θ̈_est − g·sinθ) / cosθ
+        // a_x' = −L·θ̈ + g·sinθ + z̈·cosθ  →  z̈ = (a_x' + L·θ̈_est − g·sinθ)/cosθ
+        // theta_ddot_est_ is now model-based (not from noisy gyro finite-diff),
+        // so L·θ̈_est introduces only ~0.016 m/s² noise instead of ~0.55 m/s².
         const double cos_th = std::cos(theta_est_);
-        z_ddot_est_ = (std::abs(cos_th) > 0.1)
+        const double raw_z_ddot = (std::abs(cos_th) > 0.1)
             ? (last_imu_.a_x_prime + pcfg_.L * theta_ddot_est_
                - pcfg_.g * std::sin(theta_est_)) / cos_th
             : 0.0;
+        z_ddot_est_ = alpha_ddot * z_ddot_est_ + (1.0 - alpha_ddot) * raw_z_ddot;
         z_dot_est_ += z_ddot_est_ * dt;
         z_est_     += z_dot_est_ * dt;
         if (new_enc && last_enc_.valid) {
-            const double alpha_z = scfg_.tau_z / (scfg_.tau_z + dt);
+            const double dt_enc = scfg_.encoder_period.to_seconds();
+            const double alpha_z = scfg_.tau_z / (scfg_.tau_z + dt_enc);
             z_est_ = alpha_z * z_est_ + (1.0 - alpha_z) * last_enc_.z_quantized;
+
+            // Anchor z_dot_est with encoder finite difference — prevents integration
+            // drift that is otherwise uncorrectable from position-only encoder updates.
+            // Encoder velocity resolution: 1mm/10ms = 0.1 m/s; tau_zdot=300ms prevents
+            // quantisation chatter while still bounding long-term drift.
+            if (last_enc_prev_.valid) {
+                const double z_dot_enc = (last_enc_.z_quantized
+                                          - last_enc_prev_.z_quantized) / dt_enc;
+                const double alpha_zdot = scfg_.tau_zdot / (scfg_.tau_zdot + dt_enc);
+                z_dot_est_ = alpha_zdot * z_dot_est_
+                           + (1.0 - alpha_zdot) * z_dot_enc;
+            }
+            last_enc_prev_ = last_enc_;
         }
 
         // ── Outer loop: z position → θ setpoint ──────────────────────────
@@ -203,21 +254,33 @@ void FusionControl::run() {
         const double z_decay     = z_unwinding ? scfg_.z_accum_decay_factor : 1.0;
         int_z_ = clamp(int_z_ + z_decay * z_increment, scfg_.integrator_clamp_z);
 
-        double theta_setpoint = scfg_.Kp_z * z_est_
-                              + scfg_.Ki_z * int_z_
-                              + scfg_.Kd_z * z_dot_est_;
-        theta_setpoint = clamp(theta_setpoint, scfg_.theta_setpoint_clamp);
+        const double outer_P = scfg_.Kp_z * z_est_;
+        const double outer_I = scfg_.Ki_z * int_z_;
+        const double outer_D = scfg_.Kd_z * z_dot_est_;
+        const double theta_setpoint_raw = (outer_P + outer_I + outer_D);
+        double theta_setpoint = clamp(theta_setpoint_raw, scfg_.theta_setpoint_clamp);
 
         // ── Inner loop: single angle PID toward θ_setpoint ───────────────
-        const double e_theta = wrap_angle(theta_est_ - theta_setpoint);
+        const double e_theta  = wrap_angle(theta_est_ - theta_setpoint);
         int_theta_ = clamp(int_theta_ + e_theta * dt, scfg_.integrator_clamp_theta);
-        const double F = -(scfg_.Kp_theta * e_theta
-                         + scfg_.Ki_theta * int_theta_
-                         + scfg_.Kd_theta * theta_dot_est_);
+        const double inner_P  = scfg_.Kp_theta * e_theta;
+        const double inner_I  = scfg_.Ki_theta * int_theta_;
+        const double inner_D  = scfg_.Kd_theta * theta_dot_est_;
+        const double force_raw = -(inner_P + inner_I + inner_D);
 
-        cmd.force = clamp(F, scfg_.force_saturation);
+        cmd.force = clamp(force_raw, scfg_.force_saturation);
         cmd.valid = true;
+        last_cmd_force_ = cmd.force;
         out.nb_write(cmd);
+
+        ctrl_csv_ << cmd.timestamp.to_seconds()  << ","
+                  << theta_est_        << "," << theta_dot_est_  << "," << theta_ddot_est_ << ","
+                  << z_est_            << "," << z_dot_est_      << "," << z_ddot_est_     << ","
+                  << outer_P           << "," << outer_I         << "," << outer_D         << ","
+                  << theta_setpoint_raw<< "," << theta_setpoint  << ","
+                  << e_theta           << ","
+                  << inner_P           << "," << inner_I         << "," << inner_D         << ","
+                  << force_raw         << "," << cmd.force       << "\n";
 
         // Bleed z integrator when settled — if |F| is small the system is near
         // equilibrium and any residual accumulation should drain away passively.
@@ -257,15 +320,17 @@ Plant::~Plant() {
 }
 
 void Plant::write_csv_header() {
-    csv_ << "time_s,theta,theta_dot,z,z_dot,force_applied,tau_disturbance\n";
+    csv_ << "time_s,theta,theta_dot,theta_ddot,z,z_dot,z_ddot,force_applied,tau_disturbance\n";
 }
 
 void Plant::write_csv_row(double t) {
     csv_ << t                      << ","
          << state_.theta           << ","
          << state_.theta_dot       << ","
+         << state_.theta_ddot      << ","
          << state_.z               << ","
          << state_.z_dot           << ","
+         << state_.z_ddot          << ","
          << current_force_         << ","
          << state_.tau_disturbance << "\n";
 }
