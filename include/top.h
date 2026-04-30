@@ -57,7 +57,7 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 // FusionControl  — complementary filter + dual PID, runs at control_period
 // ─────────────────────────────────────────────────────────────────────────────
-#define USE_FULL_STATE true
+#define USE_FULL_STATE false
 SC_MODULE(FusionControl) {
 public:
     sc_core::sc_fifo_in<IMUSample>       imu_in;
@@ -88,7 +88,9 @@ private:
     const PlantState* state_; //used when USE_FULL_STATE = true
 
     // Complementary filter state
+    double gyro_ema_      = 0.0;  // EMA-filtered gyro, alpha=0.5 (~3-sample window)
     double theta_est_     = 0.0;
+    double theta_from_accel = 0.0; //estimated angle just from accelerometer
     double theta_dot_est_ = 0.0;
     double theta_ddot_est_ = 0.0;  // model-based (EOM solve); used next tick for accel bias removal
     double z_est_         = 0.0;

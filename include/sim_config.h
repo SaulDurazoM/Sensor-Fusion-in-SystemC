@@ -32,9 +32,9 @@ struct SimConfig {
     // Gains produce a desired angle offset (rad), not force directly.
     // θ_setpoint = Kp_z·z + Ki_z·∫z + Kd_z·ż, clamped to ±theta_setpoint_clamp.
     // Positive z (cart right) → positive θ_setpoint (lean left) → net leftward force.
-    double Kp_z                 = 0.05;    // rad/m
+    double Kp_z                 = 0.075;    // rad/m
     double Ki_z                 = 0.005;   // rad/(m·s)
-    double Kd_z                 = 0.05;    // rad·s/m
+    double Kd_z                 = 0.075;    // rad·s/m
     double integrator_clamp_z   = 5.0;   // m·s  (raw integral safety clamp)
     double theta_setpoint_clamp = 0.25;   // rad  (~14°, hard limit on angle bias)
 
@@ -50,19 +50,16 @@ struct SimConfig {
 
     // ── Complementary filter time constants ──────────────────────────────
     // alpha is derived each tick as tau/(tau+dt) so bandwidth is dt-invariant.
-    double tau_theta = 0.05;   // gyro/accel crossover (s) — 50ms
+    double tau_theta = 0.50;   // gyro/accel crossover (s) — 500ms
     double tau_z     = 0.10;   // IMU/encoder crossover (s) — 100ms
     double tau_zdot  = 0.30;   // encoder finite-diff → z_dot_est anchor (s) — 300ms
     double tau_ddot  = 0.02;   // low-pass for theta_ddot_est and z_ddot_est (s) — 20ms
 
     // ── Sensor noise (std dev) ────────────────────────────────────────────
-    // double gyro_noise_std     = 0.005;  // rad/s
-    // double accel_noise_std    = 0.1;    // m/s²
-    // double encoder_resolution = 0.001;  // m per encoder count
-    double gyro_noise_std     = 0.00;  // rad/s
-    double accel_noise_std    = 0.0;    // m/s²
-    double encoder_resolution = 0.000001;  // m per encoder count
-
+    double gyro_noise_std     = 0.15;  // rad/s
+    double accel_noise_std    = 0.5;    // m/s²
+    double encoder_resolution = 0.1;  // m per encoder count
+    
     // ── Compute time distributions (μ, σ) in microseconds ─────────────────
     // Each module samples N(mean, std) each cycle; clamped to ≥ 0
     double imu_compute_mean_us  = 50.0;

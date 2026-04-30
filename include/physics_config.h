@@ -23,9 +23,9 @@ struct PhysicsConfig {
     double I_pivot() const { return I_cm() + m_p * (L/2.0) * (L/2.0); }
 
     // ── Initial conditions [θ, θ̇, z, ż] ─────────────────────────────────
-    double theta_0     = 0.05;   // small initial tilt (rad)
+    double theta_0     = 0.0;   // small initial tilt (rad)
     double theta_dot_0 = 0.0;
-    double z_0         = 0.0;
+    double z_0         = 0.5;
     double z_dot_0     = 0.0;
 
     // ── Disturbance schedule ──────────────────────────────────────────────

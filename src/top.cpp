@@ -114,7 +114,7 @@ FusionControl::FusionControl(sc_module_name name,
     if (!ctrl_csv_.is_open())
         SC_REPORT_FATAL("FusionControl", ("Cannot open control CSV: " + path).c_str());
     ctrl_csv_ << "time_s,"
-              << "theta_est,theta_dot_est,theta_ddot_est,"
+              << "theta_est,theta_est_accel,theta_dot_est,theta_ddot_est,"
               << "z_est,z_dot_est,z_ddot_est,"
               << "outer_P,outer_I,outer_D,theta_setpoint_raw,theta_setpoint,"
               << "e_theta,inner_P,inner_I,inner_D,force_raw,force\n";
@@ -228,11 +228,14 @@ void FusionControl::run()
 
             const double a_y_corrected = last_imu_.a_y_prime + pcfg_.L * theta_dot_est_ * theta_dot_est_ + z_ddot_est_ * std::sin(theta_est_);
 
-            const double theta_from_accel = std::atan2(a_x_corrected, a_y_corrected);
+            //trying to filter the accel angle estimate?
+            theta_from_accel = 0.1 * std::atan2(a_x_corrected, a_y_corrected) + (1 - 0.1) * theta_from_accel;
+
+            gyro_ema_ = 0.2 * last_imu_.omega + (1 - 0.2) * gyro_ema_;
 
             const double alpha_theta = scfg_.tau_theta / (scfg_.tau_theta + dt);
-            theta_est_ = alpha_theta * (theta_est_ + last_imu_.omega * dt) + (1.0 - alpha_theta) * theta_from_accel;
-            theta_dot_est_ = last_imu_.omega;
+            theta_est_ = alpha_theta * (theta_est_ + gyro_ema_ * dt) + (1.0 - alpha_theta) * theta_from_accel;
+            theta_dot_est_ = gyro_ema_;
 
             // ── Complementary filter: z ───────────────────────────────────────
             // a_x' = −L·θ̈ + g·sinθ + z̈·cosθ  →  z̈ = (a_x' + L·θ̈_est − g·sinθ)/cosθ
@@ -294,7 +297,7 @@ void FusionControl::run()
         out.nb_write(cmd);
 
         ctrl_csv_ << cmd.timestamp.to_seconds() << ","
-                  << theta_est_ << "," << theta_dot_est_ << "," << theta_ddot_est_ << ","
+                  << theta_est_ << "," << theta_from_accel << "," << theta_dot_est_ << "," << theta_ddot_est_ << ","
                   << z_est_ << "," << z_dot_est_ << "," << z_ddot_est_ << ","
                   << outer_P << "," << outer_I << "," << outer_D << ","
                   << theta_setpoint_raw << "," << theta_setpoint << ","
