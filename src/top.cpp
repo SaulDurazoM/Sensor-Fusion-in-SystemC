@@ -19,6 +19,14 @@ IMUSensor::IMUSensor(sc_module_name name,
       accel_noise_(0.0, scfg.accel_noise_std),
       compute_dist_(scfg.imu_compute_mean_us, scfg.imu_compute_std_us)
 {
+    const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/imu.csv";
+    std::filesystem::create_directories(dir);
+    csv_.open(path);
+    if (!csv_.is_open())
+        SC_REPORT_FATAL("IMUSensor", ("Cannot open IMU CSV: " + path).c_str());
+    csv_ << "time_s,seq,omega,a_x_prime,a_y_prime,disturbed\n";
+
     SC_THREAD(run);
 }
 
@@ -53,10 +61,16 @@ void IMUSensor::run()
         const double tdd = state_->theta_ddot;
 
         s.a_x_prime = -pcfg_.L * tdd + pcfg_.g * std::sin(th) + zdd * std::cos(th) + accel_noise_(rng_);
-
         s.a_y_prime = -pcfg_.L * thd * thd + pcfg_.g * std::cos(th) - zdd * std::sin(th) + accel_noise_(rng_);
 
         out.nb_write(s); // drop on overflow; rate-matched so rarely happens
+
+        csv_ << s.timestamp.to_seconds() << ","
+             << s.seq << ","
+             << s.omega << ","
+             << s.a_x_prime << ","
+             << s.a_y_prime << ","
+             << s.disturbed << "\n";
     }
 }
 
@@ -69,6 +83,14 @@ EncoderSensor::EncoderSensor(sc_module_name name,
     : sc_module(name), scfg_(scfg), state_(state),
       compute_dist_(scfg.enc_compute_mean_us, scfg.enc_compute_std_us)
 {
+    const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/encoder.csv";
+    std::filesystem::create_directories(dir);
+    csv_.open(path);
+    if (!csv_.is_open())
+        SC_REPORT_FATAL("EncoderSensor", ("Cannot open encoder CSV: " + path).c_str());
+    csv_ << "time_s,seq,z_quantized\n";
+
     SC_THREAD(run);
 }
 
@@ -94,6 +116,10 @@ void EncoderSensor::run()
         s.z_quantized = std::round(state_->z / res) * res;
 
         out.nb_write(s);
+
+        csv_ << s.timestamp.to_seconds() << ","
+             << s.seq << ","
+             << s.z_quantized << "\n";
     }
 }
 
@@ -105,7 +131,8 @@ FusionControl::FusionControl(sc_module_name name,
                              const SimConfig &scfg, const PhysicsConfig &pcfg, const PlantState *state)
     : sc_module(name), scfg_(scfg), pcfg_(pcfg), state_(state),
       compute_normal_dist_(scfg.fc_compute_mean_us, scfg.fc_compute_std_us),
-      compute_disturbed_dist_(scfg.fc_disturbed_mean_us, scfg.fc_disturbed_std_us)
+      compute_disturbed_dist_(scfg.fc_disturbed_mean_us, scfg.fc_disturbed_std_us),
+      a_y_corrected(pcfg.g)
 {
     const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
     const std::string path = dir + "/control.csv";
@@ -224,9 +251,9 @@ void FusionControl::run()
 
             // ── Complementary filter: θ ───────────────────────────────────────
             // Remove previous-tick dynamic bias from both axes, then use atan2.
-            const double a_x_corrected = last_imu_.a_x_prime + pcfg_.L * theta_ddot_est_ - z_ddot_est_ * std::cos(theta_est_);
+            a_x_corrected = 0.1 * (last_imu_.a_x_prime + pcfg_.L * theta_ddot_est_ - z_ddot_est_ * std::cos(theta_est_)) + (1-0.1) * a_x_corrected;
 
-            const double a_y_corrected = last_imu_.a_y_prime + pcfg_.L * theta_dot_est_ * theta_dot_est_ + z_ddot_est_ * std::sin(theta_est_);
+            a_y_corrected = 0.1 * (last_imu_.a_y_prime + pcfg_.L * theta_dot_est_ * theta_dot_est_ + z_ddot_est_ * std::sin(theta_est_)) + (1-0.1) * a_y_corrected;
 
             //trying to filter the accel angle estimate?
             theta_from_accel = 0.1 * std::atan2(a_x_corrected, a_y_corrected) + (1 - 0.1) * theta_from_accel;

@@ -8,7 +8,7 @@ struct SimConfig {
     std::string output_dir      = "results";
     std::string disturbance_csv = "resources/disturbances.csv";
 
-    sc_core::sc_time simulation_duration = sc_core::sc_time(10, sc_core::SC_SEC);
+    sc_core::sc_time simulation_duration = sc_core::sc_time(20, sc_core::SC_SEC);
 
     // ── Timing ────────────────────────────────────────────────────────────
     sc_core::sc_time plant_dt       = sc_core::sc_time(500, sc_core::SC_US);  // 2 kHz RK4

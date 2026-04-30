@@ -32,6 +32,7 @@ private:
     std::normal_distribution<double> gyro_noise_;
     std::normal_distribution<double> accel_noise_;
     std::normal_distribution<double> compute_dist_;
+    std::ofstream csv_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ private:
     std::uint64_t seq_ = 0;
     std::mt19937  rng_{ 99 };
     std::normal_distribution<double> compute_dist_;
+    std::ofstream csv_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +93,8 @@ private:
     double gyro_ema_      = 0.0;  // EMA-filtered gyro, alpha=0.5 (~3-sample window)
     double theta_est_     = 0.0;
     double theta_from_accel = 0.0; //estimated angle just from accelerometer
+    double a_x_corrected    = 0.0;
+    double a_y_corrected;
     double theta_dot_est_ = 0.0;
     double theta_ddot_est_ = 0.0;  // model-based (EOM solve); used next tick for accel bias removal
     double z_est_         = 0.0;
