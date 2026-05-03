@@ -51,3 +51,5 @@ __pycache__/
 docker-compose.override.yml
 
 .venv/
+
+**.mp4

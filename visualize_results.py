@@ -18,7 +18,7 @@ RESULTS_DIR = Path("results/normal")
 
 # Set to a filename like "pendulum.mp4" to export the animation instead of showing it
 # live. Requires ffmpeg on PATH. Set to None to just display interactively.
-SAVE_ANIMATION_TO = None  # e.g. "pendulum.mp4" or "pendulum.gif"
+SAVE_ANIMATION_TO = "pendulum.mp4"  # e.g. "pendulum.mp4" or "pendulum.gif"
 ANIMATION_SPEED = 0.5  # 1.0 = real-time, 0.5 = 2x speed (matches original .m), 2.0 = half speed
 
 P = pd.read_csv(RESULTS_DIR / "plant_state.csv")
