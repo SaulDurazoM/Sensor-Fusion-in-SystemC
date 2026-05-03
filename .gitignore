@@ -49,3 +49,5 @@ __pycache__/
 
 # Docker overrides / local-only files
 docker-compose.override.yml
+
+.venv/
