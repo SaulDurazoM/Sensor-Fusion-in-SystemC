@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <fstream>
 #include <random>
 #include <systemc>
@@ -17,6 +18,10 @@ SC_MODULE(IMUSensor) {
 public:
     sc_core::sc_fifo_out<IMUSample> out;
 
+    // Counters exposed to Telemetry — written only by this module's thread.
+    std::uint64_t emitted_   = 0;
+    std::uint64_t drops_     = 0;   // increments when out.nb_write() returns false
+
     SC_HAS_PROCESS(IMUSensor);
     IMUSensor(sc_core::sc_module_name name,
               const SimConfig& scfg, const PhysicsConfig& pcfg,
@@ -32,6 +37,7 @@ private:
     std::normal_distribution<double> gyro_noise_;
     std::normal_distribution<double> accel_noise_;
     std::normal_distribution<double> compute_dist_;
+    std::ofstream csv_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +46,9 @@ private:
 SC_MODULE(EncoderSensor) {
 public:
     sc_core::sc_fifo_out<EncoderSample> out;
+
+    std::uint64_t emitted_ = 0;
+    std::uint64_t drops_   = 0;
 
     SC_HAS_PROCESS(EncoderSensor);
     EncoderSensor(sc_core::sc_module_name name,
@@ -52,21 +61,26 @@ private:
     std::uint64_t seq_ = 0;
     std::mt19937  rng_{ 99 };
     std::normal_distribution<double> compute_dist_;
+    std::ofstream csv_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FusionControl  — complementary filter + dual PID, runs at control_period
 // ─────────────────────────────────────────────────────────────────────────────
-#define USE_FULL_STATE false
 SC_MODULE(FusionControl) {
 public:
     sc_core::sc_fifo_in<IMUSample>       imu_in;
     sc_core::sc_fifo_in<EncoderSample>   enc_in;
     sc_core::sc_fifo_out<ControlCommand> out;
 
+    // Counters exposed to Telemetry.
+    std::uint64_t emitted_          = 0;
+    std::uint64_t drops_            = 0;   // out.nb_write() returned false
+    std::uint64_t deadline_misses_  = 0;   // tick released later than scheduled
+
     SC_HAS_PROCESS(FusionControl);
     FusionControl(sc_core::sc_module_name name,
-                  const SimConfig& scfg, const PhysicsConfig& pcfg , const PlantState* state);
+                  const SimConfig& scfg, const PhysicsConfig& pcfg, const PlantState* state);
     void run();
 
 private:
@@ -84,18 +98,20 @@ private:
 
     double last_cmd_force_ = 0.0;  // force from previous tick; used for model-based θ̈
 
-    //Alternatively use purely the full state feedback to calculate commands (used for PID constant verification)
-    const PlantState* state_; //used when USE_FULL_STATE = true
+    // Used when scfg_.use_full_state is true — bypasses estimation for PID tuning.
+    const PlantState* state_;
 
     // Complementary filter state
-    double gyro_ema_      = 0.0;  // EMA-filtered gyro, alpha=0.5 (~3-sample window)
-    double theta_est_     = 0.0;
-    double theta_from_accel = 0.0; //estimated angle just from accelerometer
-    double theta_dot_est_ = 0.0;
-    double theta_ddot_est_ = 0.0;  // model-based (EOM solve); used next tick for accel bias removal
-    double z_est_         = 0.0;
-    double z_dot_est_     = 0.0;
-    double z_ddot_est_    = 0.0;   // stored each tick for next tick's theta bias removal
+    double gyro_ema_        = 0.0;   // EMA-filtered gyro, alpha=0.5 (~3-sample window)
+    double theta_est_       = 0.0;
+    double theta_from_accel = 0.0;   // estimated angle just from accelerometer
+    double a_x_corrected    = 0.0;
+    double a_y_corrected    = 0.0;   // overridden in ctor to pcfg.g for a smoother startup
+    double theta_dot_est_   = 0.0;
+    double theta_ddot_est_  = 0.0;   // model-based (EOM solve); used next tick for accel bias removal
+    double z_est_           = 0.0;
+    double z_dot_est_       = 0.0;
+    double z_ddot_est_      = 0.0;   // stored each tick for next tick's theta bias removal
 
     // PID integrators
     double int_theta_ = 0.0;
@@ -120,6 +136,9 @@ SC_MODULE(Plant) {
 public:
     sc_core::sc_fifo_in<ControlCommand>    control_in;
     sc_core::sc_fifo_in<DisturbanceTorque> disturbance_in;
+
+    std::uint64_t deadline_misses_ = 0;
+    std::uint64_t cmds_consumed_   = 0;
 
     SC_HAS_PROCESS(Plant);
     Plant(sc_core::sc_module_name name,
@@ -167,10 +186,45 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Telemetry  — periodically samples FIFO occupancy; writes a final summary
+// (deadline misses, drops, throughput) at end_of_simulation().
+// ─────────────────────────────────────────────────────────────────────────────
+SC_MODULE(Telemetry) {
+public:
+    SC_HAS_PROCESS(Telemetry);
+    Telemetry(sc_core::sc_module_name name,
+              const SimConfig& scfg,
+              sc_core::sc_fifo<IMUSample>*         imu_fifo,
+              sc_core::sc_fifo<EncoderSample>*     enc_fifo,
+              sc_core::sc_fifo<ControlCommand>*    ctrl_fifo,
+              sc_core::sc_fifo<DisturbanceTorque>* dist_fifo,
+              IMUSensor*     imu_mod,
+              EncoderSensor* enc_mod,
+              FusionControl* fc_mod,
+              Plant*         plant_mod);
+
+    void run();
+    void end_of_simulation() override;
+
+private:
+    SimConfig scfg_;
+    sc_core::sc_fifo<IMUSample>*         imu_fifo_;
+    sc_core::sc_fifo<EncoderSample>*     enc_fifo_;
+    sc_core::sc_fifo<ControlCommand>*    ctrl_fifo_;
+    sc_core::sc_fifo<DisturbanceTorque>* dist_fifo_;
+    IMUSensor*     imu_mod_;
+    EncoderSensor* enc_mod_;
+    FusionControl* fc_mod_;
+    Plant*         plant_mod_;
+    std::ofstream  fifo_csv_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Top  — owns all FIFOs and modules; wires everything in constructor
 //
 // Member declaration order matters: Plant must come before IMUSensor/Encoder
-// so its constructor (and therefore get_state()) runs first.
+// so its constructor (and therefore get_state()) runs first. Telemetry must
+// come last so all module pointers are valid when its ctor runs.
 // ─────────────────────────────────────────────────────────────────────────────
 SC_MODULE(Top) {
 public:
@@ -182,11 +236,12 @@ public:
     sc_core::sc_fifo<ControlCommand>    control_fifo;
     sc_core::sc_fifo<DisturbanceTorque> disturbance_fifo;
 
-    Plant         plant;        // constructed first — sensors need get_state()
+    Plant         plant;
     IMUSensor     imu;
     EncoderSensor encoder;
     FusionControl fusion_ctrl;
     Disturbance   disturbance;
+    Telemetry     telemetry;
 
     Top(sc_core::sc_module_name name,
         const SimConfig& s, const PhysicsConfig& p);

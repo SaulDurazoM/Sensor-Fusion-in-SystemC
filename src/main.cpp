@@ -37,16 +37,29 @@ static void load_disturbances(PhysicsConfig& pcfg, const std::string& path) {
               << " disturbance events from '" << path << "'\n";
 }
 
+static void print_usage(const char* prog) {
+    std::cerr << "Usage: " << prog << " [case] [duration_ms]\n"
+              << "  case         one of: normal | stress | burst   (default: normal)\n"
+              << "  duration_ms  simulation duration in milliseconds (default: from SimConfig)\n";
+}
+
 int sc_main(int argc, char* argv[]) {
     SimConfig     scfg = SimConfig::normal();
     PhysicsConfig pcfg;
 
     if (argc >= 2) {
         const std::string name = argv[1];
-        if (name == "normal") {
-            scfg = SimConfig::normal();
-        } else {
-            std::cerr << "Unknown case '" << name << "'. Using normal.\n";
+        if (name == "-h" || name == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if      (name == "normal") scfg = SimConfig::normal();
+        else if (name == "stress") scfg = SimConfig::stress();
+        else if (name == "burst")  scfg = SimConfig::burst();
+        else {
+            std::cerr << "Unknown case '" << name << "'.\n";
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
@@ -65,11 +78,17 @@ int sc_main(int argc, char* argv[]) {
 
     load_disturbances(pcfg, scfg.disturbance_csv);
 
-    std::cout << "Case:     " << scfg.case_name          << "\n";
+    std::cout << "Case:     " << scfg.case_name           << "\n";
     std::cout << "Duration: " << scfg.simulation_duration << "\n";
 
     Top top("top", scfg, pcfg);
     sc_start(scfg.simulation_duration);
+
+    // Trigger end_of_simulation() callbacks (e.g. Telemetry::end_of_simulation()
+    // writes summary.csv). Without this, sc_start() returns due to time-out
+    // and the kernel does not invoke end_of_simulation() in all SystemC
+    // implementations.
+    sc_stop();
 
     std::cout << "Simulation finished at " << sc_time_stamp() << "\n";
     return 0;
