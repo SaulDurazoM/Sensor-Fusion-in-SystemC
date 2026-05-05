@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     g++ \
     wget \
     tar \
+    libeigen3-dev \
     python3 \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*

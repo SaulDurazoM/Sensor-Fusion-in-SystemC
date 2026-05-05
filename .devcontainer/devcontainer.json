@@ -1,0 +1,22 @@
+{
+    "name": "SystemC Sensor Fusion",
+    "dockerComposeFile": "../docker-compose.yml",
+    "service": "systemc",
+    "workspaceFolder": "/workspace",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools"
+            ],
+            "settings": {
+                "C_Cpp.default.includePath": [
+                    "/usr/local/systemc/include",
+                    "${workspaceFolder}/include"
+                ],
+                "C_Cpp.default.compilerPath": "/usr/bin/g++",
+                "C_Cpp.default.cppStandard": "c++17"
+            }
+        }
+    }
+}

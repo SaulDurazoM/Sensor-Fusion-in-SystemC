@@ -1,292 +1,555 @@
 #include "top.h"
 
+#include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
-#include <sstream>
 
 using namespace sc_core;
 
-namespace {
-double to_ms(const sc_time& t) {
-    return t.to_seconds() * 1000.0;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// IMUSensor
+// ─────────────────────────────────────────────────────────────────────────────
 
-template <typename T>
-int fifo_occupancy_after_write(const sc_fifo_out<T>& port, int depth) {
-    return depth - port.num_free();
-}
-}
+IMUSensor::IMUSensor(sc_module_name name,
+                     const SimConfig &scfg, const PhysicsConfig &pcfg,
+                     const PlantState *state)
+    : sc_module(name), scfg_(scfg), pcfg_(pcfg), state_(state),
+      gyro_noise_(0.0, scfg.gyro_noise_std),
+      accel_noise_(0.0, scfg.accel_noise_std),
+      compute_dist_(scfg.imu_compute_mean_us, scfg.imu_compute_std_us)
+{
+    const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/imu.csv";
+    std::filesystem::create_directories(dir);
+    csv_.open(path);
+    if (!csv_.is_open())
+        SC_REPORT_FATAL("IMUSensor", ("Cannot open IMU CSV: " + path).c_str());
+    csv_ << "time_s,seq,omega,a_x_prime,a_y_prime,disturbed\n";
 
-IMUSource::IMUSource(sc_module_name name, const Config& cfg, Telemetry& telemetry)
-    : sc_module(name), cfg_(cfg), telemetry_(telemetry) {
     SC_THREAD(run);
 }
 
-bool IMUSource::in_burst_window(const sc_time& now) const {
-    return cfg_.burst_enabled && now >= cfg_.burst_start && now < cfg_.burst_end;
-}
+void IMUSensor::run()
+{
+    sc_time next_release = SC_ZERO_TIME;
+    while (true)
+    {
+        if (sc_time_stamp() < next_release)
+            wait(next_release - sc_time_stamp());
+        next_release += scfg_.imu_period;
 
-void IMUSource::run() {
-    while (true) {
-        const bool burst = in_burst_window(sc_time_stamp());
-        const sc_time period = burst ? cfg_.imu_burst_period : cfg_.imu_period;
-        wait(period);
+        const double comp = std::max(0.0, compute_dist_(rng_));
+        if (comp > 0.0)
+            wait(sc_time(comp, SC_US));
 
-        IMUSample sample;
-        sample.seq = seq_++;
-        sample.ax = 0.1 * static_cast<double>(sample.seq);
-        sample.ay = 0.2 * static_cast<double>(sample.seq);
-        sample.az = 9.81;
-        sample.gx = 0.01;
-        sample.gy = 0.02;
-        sample.gz = 0.03 + 0.0001 * static_cast<double>(sample.seq);
-        sample.timestamp = sc_time_stamp();
-        sample.valid = true;
-        sample.burst = burst;
+        IMUSample s;
+        s.seq = seq_++;
+        s.timestamp = sc_time_stamp();
+        s.valid = true;
+        s.disturbed = state_->disturbed;
 
-        if (!out.nb_write(sample)) {
-            telemetry_.log_fifo_overflow("imu_fifo", sc_time_stamp(), to_string(cfg_.overflow_policy));
-            telemetry_.log_event(sc_time_stamp(), "imu", "drop", "seq=" + std::to_string(sample.seq));
-        } else {
-            telemetry_.log_fifo_occupancy("imu_fifo", sc_time_stamp(), fifo_occupancy_after_write(out, cfg_.imu_fifo_depth));
-            telemetry_.log_event(sc_time_stamp(), "imu", "produce", "seq=" + std::to_string(sample.seq) + ", burst=" + std::to_string(static_cast<int>(burst)));
-        }
+        s.omega = state_->theta_dot + gyro_noise_(rng_);
+
+        // Raw body-frame accelerometer outputs — FusionControl interprets these.
+        // Frame: x̂'=(cosθ, sinθ) aligns with world +x at upright (right-handed with ŷ').
+        // a_x' (perp to rod, +x at upright): −L·θ̈ + g·sin θ + z̈·cos θ
+        // a_y' (along rod,   +y at upright): −L·θ̇² + g·cos θ − z̈·sin θ
+        const double th = state_->theta;
+        const double thd = state_->theta_dot;
+        const double zdd = state_->z_ddot;
+        const double tdd = state_->theta_ddot;
+
+        s.a_x_prime = -pcfg_.L * tdd + pcfg_.g * std::sin(th) + zdd * std::cos(th) + accel_noise_(rng_);
+        s.a_y_prime = -pcfg_.L * thd * thd + pcfg_.g * std::cos(th) - zdd * std::sin(th) + accel_noise_(rng_);
+
+        out.nb_write(s); // drop on overflow; rate-matched so rarely happens
+
+        csv_ << s.timestamp.to_seconds() << ","
+             << s.seq << ","
+             << s.omega << ","
+             << s.a_x_prime << ","
+             << s.a_y_prime << ","
+             << s.disturbed << "\n";
     }
 }
 
-GPSSource::GPSSource(sc_module_name name, const Config& cfg, Telemetry& telemetry)
-    : sc_module(name), cfg_(cfg), telemetry_(telemetry) {
+// ─────────────────────────────────────────────────────────────────────────────
+// EncoderSensor
+// ─────────────────────────────────────────────────────────────────────────────
+
+EncoderSensor::EncoderSensor(sc_module_name name,
+                             const SimConfig &scfg, const PlantState *state)
+    : sc_module(name), scfg_(scfg), state_(state),
+      compute_dist_(scfg.enc_compute_mean_us, scfg.enc_compute_std_us)
+{
+    const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/encoder.csv";
+    std::filesystem::create_directories(dir);
+    csv_.open(path);
+    if (!csv_.is_open())
+        SC_REPORT_FATAL("EncoderSensor", ("Cannot open encoder CSV: " + path).c_str());
+    csv_ << "time_s,seq,z_quantized\n";
+
     SC_THREAD(run);
 }
 
-bool GPSSource::in_burst_window(const sc_time& now) const {
-    return cfg_.burst_enabled && now >= cfg_.burst_start && now < cfg_.burst_end;
-}
+void EncoderSensor::run()
+{
+    sc_time next_release = SC_ZERO_TIME;
+    while (true)
+    {
+        if (sc_time_stamp() < next_release)
+            wait(next_release - sc_time_stamp());
+        next_release += scfg_.encoder_period;
 
-void GPSSource::run() {
-    while (true) {
-        const bool burst = in_burst_window(sc_time_stamp());
-        const sc_time period = burst ? cfg_.gps_burst_period : cfg_.gps_period;
-        wait(period);
+        const double comp = std::max(0.0, compute_dist_(rng_));
+        if (comp > 0.0)
+            wait(sc_time(comp, SC_US));
 
-        GPSSample sample;
-        sample.seq = seq_++;
-        sample.latitude = 32.2319 + 0.00001 * static_cast<double>(sample.seq);
-        sample.longitude = -110.9501 + 0.00001 * static_cast<double>(sample.seq);
-        sample.altitude = 728.0;
-        sample.velocity = 5.0 + 0.001 * static_cast<double>(sample.seq);
-        sample.timestamp = sc_time_stamp();
-        sample.valid = true;
-        sample.burst = burst;
+        const double res = scfg_.encoder_resolution;
 
-        if (!out.nb_write(sample)) {
-            telemetry_.log_fifo_overflow("gps_fifo", sc_time_stamp(), to_string(cfg_.overflow_policy));
-            telemetry_.log_event(sc_time_stamp(), "gps", "drop", "seq=" + std::to_string(sample.seq));
-        } else {
-            telemetry_.log_fifo_occupancy("gps_fifo", sc_time_stamp(), fifo_occupancy_after_write(out, cfg_.gps_fifo_depth));
-            telemetry_.log_event(sc_time_stamp(), "gps", "produce", "seq=" + std::to_string(sample.seq) + ", burst=" + std::to_string(static_cast<int>(burst)));
-        }
+        EncoderSample s;
+        s.seq = seq_++;
+        s.timestamp = sc_time_stamp();
+        s.valid = true;
+        s.z_quantized = std::round(state_->z / res) * res;
+
+        out.nb_write(s);
+
+        csv_ << s.timestamp.to_seconds() << ","
+             << s.seq << ","
+             << s.z_quantized << "\n";
     }
 }
 
-Fusion::Fusion(sc_module_name name, const Config& cfg, Telemetry& telemetry)
-    : sc_module(name), cfg_(cfg), telemetry_(telemetry) {
+// ─────────────────────────────────────────────────────────────────────────────
+// FusionControl
+// ─────────────────────────────────────────────────────────────────────────────
+
+FusionControl::FusionControl(sc_module_name name,
+                             const SimConfig &scfg, const PhysicsConfig &pcfg, const PlantState *state)
+    : sc_module(name), scfg_(scfg), pcfg_(pcfg), state_(state),
+      compute_normal_dist_(scfg.fc_compute_mean_us, scfg.fc_compute_std_us),
+      compute_disturbed_dist_(scfg.fc_disturbed_mean_us, scfg.fc_disturbed_std_us),
+      a_y_corrected(pcfg.g)
+{
+    const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/control.csv";
+    std::filesystem::create_directories(dir);
+    ctrl_csv_.open(path);
+    if (!ctrl_csv_.is_open())
+        SC_REPORT_FATAL("FusionControl", ("Cannot open control CSV: " + path).c_str());
+    ctrl_csv_ << "time_s,"
+              << "theta_est,theta_est_accel,theta_dot_est,theta_ddot_est,"
+              << "z_est,z_dot_est,z_ddot_est,"
+              << "outer_P,outer_I,outer_D,theta_setpoint_raw,theta_setpoint,"
+              << "e_theta,inner_P,inner_I,inner_D,force_raw,force\n";
+
     SC_THREAD(run);
 }
 
-void Fusion::run() {
+double FusionControl::clamp(double v, double limit) const
+{
+    return std::clamp(v, -limit, limit);
+}
+
+double FusionControl::wrap_angle(double a) const
+{
+    return std::atan2(std::sin(a), std::cos(a));
+}
+
+void FusionControl::run()
+{
     sc_time next_release = SC_ZERO_TIME;
 
-    while (true) {
-        if (sc_time_stamp() < next_release) {
+    while (true)
+    {
+        if (sc_time_stamp() < next_release)
             wait(next_release - sc_time_stamp());
-        }
-        const sc_time release_time = sc_time_stamp();
-        next_release += cfg_.fusion_period;
 
-        IMUSample imu_sample;
-        while (imu_in.nb_read(imu_sample)) {
-            last_imu_ = imu_sample;
-            have_imu_ = true;
-            telemetry_.log_fifo_occupancy("imu_fifo", sc_time_stamp(), imu_in.num_available());
-        }
+        const sc_time release = sc_time_stamp();
+        next_release += scfg_.control_period;
 
-        GPSSample gps_sample;
-        while (gps_in.nb_read(gps_sample)) {
-            last_gps_ = gps_sample;
-            have_gps_ = true;
-            telemetry_.log_fifo_occupancy("gps_fifo", sc_time_stamp(), gps_in.num_available());
-        }
+        const double dt = first_tick_ ? 0.0 : (release - last_time_).to_seconds();
+        last_time_ = release;
+        first_tick_ = false;
 
-        sc_time compute_time = cfg_.fusion_compute;
-        if (cfg_.stress_enabled) {
-            compute_time += cfg_.stress_fusion_extra;
+        // Drain FIFOs into persistent members — last_imu_/last_enc_ survive across ticks
+        {
+            IMUSample tmp;
+            while (imu_in.nb_read(tmp))
+                last_imu_ = tmp;
         }
-        if (compute_time > SC_ZERO_TIME) {
-            wait(compute_time);
+        bool new_enc = false;
+        {
+            EncoderSample tmp;
+            while (enc_in.nb_read(tmp))
+            {
+                last_enc_ = tmp;
+                new_enc = true;
+            }
         }
 
-        FusionState state;
-        state.seq = seq_++;
-        state.valid = have_imu_ || have_gps_;
-        state.fusion_time = sc_time_stamp();
-
-        if (have_gps_) {
-            state.x = last_gps_.latitude;
-            state.y = last_gps_.longitude;
-            state.speed = last_gps_.velocity;
-            state.gps_time = last_gps_.timestamp;
-            state.has_gps = true;
-        }
-
-        if (have_imu_) {
-            state.heading = last_imu_.gz * 10.0;
-            state.imu_time = last_imu_.timestamp;
-            state.has_imu = true;
-        }
-
-        telemetry_.log_event(release_time, "fusion", "start", "");
-
-        if (!out.nb_write(state)) {
-            telemetry_.log_fifo_overflow("fusion_fifo", sc_time_stamp(), to_string(cfg_.overflow_policy));
-            telemetry_.log_event(sc_time_stamp(), "fusion", "drop", "seq=" + std::to_string(state.seq));
-        } else {
-            telemetry_.log_fifo_occupancy("fusion_fifo", sc_time_stamp(), fifo_occupancy_after_write(out, cfg_.fusion_fifo_depth));
-
-            std::ostringstream oss;
-            oss << "seq=" << state.seq
-                << ", valid=" << static_cast<int>(state.valid)
-                << ", release_ms=" << to_ms(release_time);
-            telemetry_.log_event(sc_time_stamp(), "fusion", "finish", oss.str());
-        }
-    }
-}
-
-Control::Control(sc_module_name name, const Config& cfg, Telemetry& telemetry)
-    : sc_module(name), cfg_(cfg), telemetry_(telemetry) {
-    SC_THREAD(run);
-}
-
-void Control::run() {
-    sc_time next_release = SC_ZERO_TIME;
-
-    while (true) {
-        if (sc_time_stamp() < next_release) {
-            wait(next_release - sc_time_stamp());
-        }
-        const sc_time release_time = sc_time_stamp();
-        next_release += cfg_.control_period;
-
-        FusionState latest_state;
-        bool have_state = false;
-        FusionState temp;
-
-        while (in.nb_read(temp)) {
-            latest_state = temp;
-            have_state = true;
-            telemetry_.log_fifo_occupancy("fusion_fifo", sc_time_stamp(), in.num_available());
-        }
-
-        sc_time compute_time = cfg_.control_compute;
-        if (cfg_.stress_enabled) {
-            compute_time += cfg_.stress_control_extra;
-        }
-        if (compute_time > SC_ZERO_TIME) {
-            wait(compute_time);
-        }
+        // Stochastic compute latency; last_imu_.disturbed is sticky across ticks
+        const bool disturbed = last_imu_.disturbed;
+        const double comp = disturbed
+                                ? std::max(0.0, compute_disturbed_dist_(rng_))
+                                : std::max(0.0, compute_normal_dist_(rng_));
+        if (comp > 0.0)
+            wait(sc_time(comp, SC_US));
 
         ControlCommand cmd;
         cmd.seq = seq_++;
-        cmd.control_time = sc_time_stamp();
-        cmd.valid = have_state && latest_state.valid;
+        cmd.timestamp = sc_time_stamp();
 
-        if (cmd.valid) {
-            cmd.throttle = 1.0;
-            cmd.steering = -0.10 * latest_state.heading;
-            cmd.imu_time = latest_state.imu_time;
-            cmd.gps_time = latest_state.gps_time;
-            cmd.fusion_time = latest_state.fusion_time;
-            cmd.has_imu = latest_state.has_imu;
-            cmd.has_gps = latest_state.has_gps;
+        if (!last_imu_.valid || !last_enc_.valid || dt <= 0.0)
+        {
+            cmd.valid = false;
+            out.nb_write(cmd);
+            continue;
         }
 
-        if (!out.nb_write(cmd)) {
-            telemetry_.log_fifo_overflow("control_fifo", sc_time_stamp(), to_string(cfg_.overflow_policy));
-            telemetry_.log_event(sc_time_stamp(), "control", "drop", "seq=" + std::to_string(cmd.seq));
-        } else {
-            telemetry_.log_fifo_occupancy("control_fifo", sc_time_stamp(), fifo_occupancy_after_write(out, cfg_.control_fifo_depth));
+        if (USE_FULL_STATE)
+        {
+            //Just use full state feedback directly without estimation
+            theta_est_ = state_->theta;
+            theta_dot_est_ = state_->theta_dot;
+            theta_ddot_est_ = state_->theta_ddot;
+            z_est_ = state_->z;
+            z_dot_est_ = state_->z_dot;
+            z_ddot_est_ = state_->z_ddot;
+        }
+        else {
+            // ── Model-based θ̈: solve 2×2 EOM with known control force ──────────
+            // Using finite-diff of gyro (raw_theta_ddot ≈ 7 rad/s² noise after LP ≈1.1 rad/s²)
+            // is worse than the signal-to-noise of z̈ (~0.08 m/s²), so we instead solve
+            // the Lagrangian mass matrix system directly given last_cmd_force_ and state.
+            // tau_d is unknown; we assume 0 (a disturbance estimator could refine this).
+            const double alpha_ddot = scfg_.tau_ddot / (scfg_.tau_ddot + dt);
+            {
+                const double th = theta_est_;
+                const double thd = theta_dot_est_;
+                const double mc = pcfg_.m_c, mp = pcfg_.m_p;
+                const double L = pcfg_.L, g = pcfg_.g;
+                const double Ip = pcfg_.I_pivot();
+                const double f_fric = pcfg_.mu * (mc + mp) * g * std::tanh(z_dot_est_ / 0.001);
+
+                Eigen::Matrix2d M;
+                M(0, 0) = mc + mp;
+                M(0, 1) = -0.5 * mp * L * std::cos(th);
+                M(1, 0) = M(0, 1);
+                M(1, 1) = Ip;
+
+                Eigen::Vector2d fvec;
+                fvec[0] = last_cmd_force_ - f_fric - 0.5 * mp * L * thd * thd * std::sin(th);
+                fvec[1] = mp * g * (L / 2.0) * std::sin(th);
+
+                const Eigen::Vector2d accel = M.ldlt().solve(fvec);
+                theta_ddot_est_ = alpha_ddot * theta_ddot_est_ + (1.0 - alpha_ddot) * accel[1];
+            }
+
+            // ── Complementary filter: θ ───────────────────────────────────────
+            // Remove previous-tick dynamic bias from both axes, then use atan2.
+            a_x_corrected = 0.1 * (last_imu_.a_x_prime + pcfg_.L * theta_ddot_est_ - z_ddot_est_ * std::cos(theta_est_)) + (1-0.1) * a_x_corrected;
+
+            a_y_corrected = 0.1 * (last_imu_.a_y_prime + pcfg_.L * theta_dot_est_ * theta_dot_est_ + z_ddot_est_ * std::sin(theta_est_)) + (1-0.1) * a_y_corrected;
+
+            //trying to filter the accel angle estimate?
+            theta_from_accel = 0.1 * std::atan2(a_x_corrected, a_y_corrected) + (1 - 0.1) * theta_from_accel;
+
+            gyro_ema_ = 0.2 * last_imu_.omega + (1 - 0.2) * gyro_ema_;
+
+            const double alpha_theta = scfg_.tau_theta / (scfg_.tau_theta + dt);
+            theta_est_ = alpha_theta * (theta_est_ + gyro_ema_ * dt) + (1.0 - alpha_theta) * theta_from_accel;
+            theta_dot_est_ = gyro_ema_;
+
+            // ── Complementary filter: z ───────────────────────────────────────
+            // a_x' = −L·θ̈ + g·sinθ + z̈·cosθ  →  z̈ = (a_x' + L·θ̈_est − g·sinθ)/cosθ
+            // theta_ddot_est_ is now model-based (not from noisy gyro finite-diff),
+            // so L·θ̈_est introduces only ~0.016 m/s² noise instead of ~0.55 m/s².
+            const double cos_th = std::cos(theta_est_);
+            const double raw_z_ddot = (std::abs(cos_th) > 0.1)
+                                          ? (last_imu_.a_x_prime + pcfg_.L * theta_ddot_est_ - pcfg_.g * std::sin(theta_est_)) / cos_th
+                                          : 0.0;
+            z_ddot_est_ = alpha_ddot * z_ddot_est_ + (1.0 - alpha_ddot) * raw_z_ddot;
+            z_dot_est_ += z_ddot_est_ * dt;
+            z_est_ += z_dot_est_ * dt;
+            if (new_enc && last_enc_.valid)
+            {
+                const double dt_enc = scfg_.encoder_period.to_seconds();
+                const double alpha_z = scfg_.tau_z / (scfg_.tau_z + dt_enc);
+                z_est_ = alpha_z * z_est_ + (1.0 - alpha_z) * last_enc_.z_quantized;
+
+                // Anchor z_dot_est with encoder finite difference — prevents integration
+                // drift that is otherwise uncorrectable from position-only encoder updates.
+                // Encoder velocity resolution: 1mm/10ms = 0.1 m/s; tau_zdot=300ms prevents
+                // quantisation chatter while still bounding long-term drift.
+                if (last_enc_prev_.valid)
+                {
+                    const double z_dot_enc = (last_enc_.z_quantized - last_enc_prev_.z_quantized) / dt_enc;
+                    const double alpha_zdot = scfg_.tau_zdot / (scfg_.tau_zdot + dt_enc);
+                    z_dot_est_ = alpha_zdot * z_dot_est_ + (1.0 - alpha_zdot) * z_dot_enc;
+                }
+                last_enc_prev_ = last_enc_;
+            }
         }
 
-        const sc_time finish_time = sc_time_stamp();
-        const bool missed_deadline = finish_time > (release_time + cfg_.control_period);
+        // ── Outer loop: z position → θ setpoint ──────────────────────────
+        // Integrator with asymmetric decay: when the new increment opposes the
+        // current accumulator (i.e. we are unwinding), scale it by decay_factor
+        // so the accumulator collapses faster than it built up.
+        const double z_increment = z_est_ * dt;
+        const bool z_unwinding = (int_z_ * z_increment) < 0.0;
+        const double z_decay = z_unwinding ? scfg_.z_accum_decay_factor : 1.0;
+        int_z_ = clamp(int_z_ + z_decay * z_increment, scfg_.integrator_clamp_z);
 
-        telemetry_.log_control_cycle(release_time, finish_time, cfg_.control_period, missed_deadline);
-        telemetry_.log_delay(cmd);
+        const double outer_P = scfg_.Kp_z * z_est_;
+        const double outer_I = scfg_.Ki_z * int_z_;
+        const double outer_D = scfg_.Kd_z * z_dot_est_;
+        const double theta_setpoint_raw = (outer_P + outer_I + outer_D);
+        double theta_setpoint = clamp(theta_setpoint_raw, scfg_.theta_setpoint_clamp);
 
-        std::ostringstream oss;
-        oss << "seq=" << cmd.seq
-            << ", valid=" << static_cast<int>(cmd.valid)
-            << ", missed=" << static_cast<int>(missed_deadline);
-        telemetry_.log_event(sc_time_stamp(), "control", "deadlines", oss.str());
+        // ── Inner loop: single angle PID toward θ_setpoint ───────────────
+        const double e_theta = wrap_angle(theta_est_ - theta_setpoint);
+        int_theta_ = clamp(int_theta_ + e_theta * dt, scfg_.integrator_clamp_theta);
+        const double inner_P = scfg_.Kp_theta * e_theta;
+        const double inner_I = scfg_.Ki_theta * int_theta_;
+        const double inner_D = scfg_.Kd_theta * theta_dot_est_;
+        const double force_raw = -(inner_P + inner_I + inner_D);
+
+        cmd.force = clamp(force_raw, scfg_.force_saturation);
+        cmd.valid = true;
+        last_cmd_force_ = cmd.force;
+        out.nb_write(cmd);
+
+        ctrl_csv_ << cmd.timestamp.to_seconds() << ","
+                  << theta_est_ << "," << theta_from_accel << "," << theta_dot_est_ << "," << theta_ddot_est_ << ","
+                  << z_est_ << "," << z_dot_est_ << "," << z_ddot_est_ << ","
+                  << outer_P << "," << outer_I << "," << outer_D << ","
+                  << theta_setpoint_raw << "," << theta_setpoint << ","
+                  << e_theta << ","
+                  << inner_P << "," << inner_I << "," << inner_D << ","
+                  << force_raw << "," << cmd.force << "\n";
+
+        // Bleed z integrator when settled — if |F| is small the system is near
+        // equilibrium and any residual accumulation should drain away passively.
+        if (std::abs(cmd.force) < scfg_.force_decay_threshold)
+        {
+            int_z_ *= (1.0 - scfg_.z_accum_bleed_rate * dt);
+        }
     }
 }
 
-Plant::Plant(sc_module_name name, const Config& cfg, Telemetry& telemetry)
-    : sc_module(name), cfg_(cfg), telemetry_(telemetry) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Plant
+// ─────────────────────────────────────────────────────────────────────────────
+
+Plant::Plant(sc_module_name name,
+             const SimConfig &scfg, const PhysicsConfig &pcfg)
+    : sc_module(name), scfg_(scfg), pcfg_(pcfg),
+      compute_dist_(scfg.plant_compute_mean_us, scfg.plant_compute_std_us)
+{
+    state_.theta = pcfg_.theta_0;
+    state_.theta_dot = pcfg_.theta_dot_0;
+    state_.z = pcfg_.z_0;
+    state_.z_dot = pcfg_.z_dot_0;
+
+    const std::string dir = scfg_.output_dir + "/" + scfg_.case_name;
+    const std::string path = dir + "/plant_state.csv";
+    std::filesystem::create_directories(dir);
+    csv_.open(path);
+    if (!csv_.is_open())
+        SC_REPORT_FATAL("Plant", ("Cannot open output CSV: " + path).c_str());
+    write_csv_header();
+
     SC_THREAD(run);
 }
 
-void Plant::run() {
-    while (true) {
-        ControlCommand cmd = in.read();
-        telemetry_.log_fifo_occupancy("control_fifo", sc_time_stamp(), in.num_available());
+Plant::~Plant()
+{
+    if (csv_.is_open())
+        csv_.close();
+}
 
-        if (cfg_.plant_compute > SC_ZERO_TIME) {
-            wait(cfg_.plant_compute);
+void Plant::write_csv_header()
+{
+    csv_ << "time_s,theta,theta_dot,theta_ddot,z,z_dot,z_ddot,force_applied,tau_disturbance\n";
+}
+
+void Plant::write_csv_row(double t)
+{
+    csv_ << t << ","
+         << state_.theta << ","
+         << state_.theta_dot << ","
+         << state_.theta_ddot << ","
+         << state_.z << ","
+         << state_.z_dot << ","
+         << state_.z_ddot << ","
+         << current_force_ << ","
+         << state_.tau_disturbance << "\n";
+}
+
+// Nonlinear equations of motion via Euler-Lagrange, CCW-positive θ convention.
+//
+// Mass matrix M · [z̈; θ̈] = f  (row 0 = z equation, row 1 = θ equation)
+// Returns dx/dt = [θ̇, θ̈, ż, z̈]  for state x = [θ, θ̇, z, ż]
+Plant::Vec4 Plant::dynamics(const Vec4 &x, double F, double tau_d) const
+{
+    const double theta = x[0];
+    const double theta_dot = x[1];
+    const double z_dot = x[3];
+
+    const double mc = pcfg_.m_c;
+    const double mp = pcfg_.m_p;
+    const double L = pcfg_.L;
+    const double g = pcfg_.g;
+    const double mu = pcfg_.mu;
+    const double Ip = pcfg_.I_pivot();
+
+    Eigen::Matrix2d M;
+    M(0, 0) = mc + mp;
+    M(0, 1) = -0.5 * mp * L * std::cos(theta);
+    M(1, 0) = M(0, 1);
+    M(1, 1) = Ip;
+
+    // Smoothed Coulomb friction on cart (tanh regularisation avoids sign discontinuity)
+    const double f_fric = mu * (mc + mp) * g * std::tanh(z_dot / 0.001);
+
+    Eigen::Vector2d f;
+    f[0] = F - f_fric - 0.5 * mp * L * theta_dot * theta_dot * std::sin(theta);
+    f[1] = tau_d + mp * g * (L / 2.0) * std::sin(theta);
+
+    const Eigen::Vector2d accel = M.ldlt().solve(f); // [z̈, θ̈]
+
+    Vec4 dx;
+    dx[0] = x[1];     // dθ/dt  = θ̇
+    dx[1] = accel[1]; // dθ̇/dt = θ̈
+    dx[2] = x[3];     // dz/dt  = ż
+    dx[3] = accel[0]; // dż/dt  = z̈
+    return dx;
+}
+
+Plant::Vec4 Plant::rk4_step(const Vec4 &x, double F, double tau_d, double dt) const
+{
+    const Vec4 k1 = dynamics(x, F, tau_d);
+    const Vec4 k2 = dynamics(x + 0.5 * dt * k1, F, tau_d);
+    const Vec4 k3 = dynamics(x + 0.5 * dt * k2, F, tau_d);
+    const Vec4 k4 = dynamics(x + dt * k3, F, tau_d);
+    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+}
+
+void Plant::run()
+{
+    sc_time next_release = SC_ZERO_TIME;
+    while (true)
+    {
+        if (sc_time_stamp() < next_release)
+            wait(next_release - sc_time_stamp());
+        next_release += scfg_.plant_dt;
+
+        const double comp = std::max(0.0, compute_dist_(rng_));
+        if (comp > 0.0)
+            wait(sc_time(comp, SC_US));
+
+        // Non-blocking drain: keep latest control force
+        {
+            ControlCommand tmp;
+            while (control_in.nb_read(tmp))
+                if (tmp.valid)
+                    current_force_ = tmp.force;
         }
 
-        if (cmd.valid) {
-            x_ += cmd.throttle * 0.01;
-            y_ += cmd.throttle * 0.005;
-            heading_ += cmd.steering * 0.01;
+        // Non-blocking drain: keep latest disturbance torque
+        {
+            DisturbanceTorque tmp;
+            while (disturbance_in.nb_read(tmp))
+                state_.tau_disturbance = tmp.tau;
         }
+        state_.disturbed = (state_.tau_disturbance != 0.0);
 
-        std::ostringstream oss;
-        oss << "x=" << x_
-            << ", y=" << y_
-            << ", heading=" << heading_
-            << ", valid=" << static_cast<int>(cmd.valid);
-        telemetry_.log_event(sc_time_stamp(), "plant", "response_trace", oss.str());
+        // RK4 integration step
+        const double dt = scfg_.plant_dt.to_seconds();
+        Vec4 x(state_.theta, state_.theta_dot, state_.z, state_.z_dot);
+        const Vec4 xn = rk4_step(x, current_force_, state_.tau_disturbance, dt);
+
+        state_.theta = xn[0];
+        state_.theta_dot = xn[1];
+        state_.z = xn[2];
+        state_.z_dot = xn[3];
+
+        // Recompute accelerations at new state so IMU reads correct values next tick
+        const Vec4 dxn = dynamics(xn, current_force_, state_.tau_disturbance);
+        state_.theta_ddot = dxn[1];
+        state_.z_ddot = dxn[3];
+
+        write_csv_row(sc_time_stamp().to_seconds());
     }
 }
 
-Top::Top(sc_module_name name, const Config& config)
+// ─────────────────────────────────────────────────────────────────────────────
+// Disturbance
+// ─────────────────────────────────────────────────────────────────────────────
+
+Disturbance::Disturbance(sc_module_name name,
+                         const SimConfig &scfg, const PhysicsConfig &pcfg)
+    : sc_module(name), scfg_(scfg), pcfg_(pcfg)
+{
+    SC_THREAD(run);
+}
+
+void Disturbance::run()
+{
+    for (const auto &ev : pcfg_.disturbances)
+    {
+        const sc_time t_start = sc_time(ev.time_s, SC_SEC);
+        const sc_time t_dur = sc_time(ev.duration_s, SC_SEC);
+
+        if (sc_time_stamp() < t_start)
+            wait(t_start - sc_time_stamp());
+
+        DisturbanceTorque on;
+        on.tau = ev.torque_nm;
+        on.timestamp = sc_time_stamp();
+        out.write(on); // blocking — blocks only if FIFO full (depth 16, never reached)
+
+        wait(t_dur);
+
+        DisturbanceTorque off;
+        off.tau = 0.0;
+        off.timestamp = sc_time_stamp();
+        out.write(off);
+    }
+
+    wait(); // all events exhausted — suspend forever
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Top
+// ─────────────────────────────────────────────────────────────────────────────
+
+Top::Top(sc_module_name name, const SimConfig &s, const PhysicsConfig &p)
     : sc_module(name),
-      cfg(config),
-      telemetry(cfg),
-      imu_fifo(cfg.imu_fifo_depth),
-      gps_fifo(cfg.gps_fifo_depth),
-      fusion_fifo(cfg.fusion_fifo_depth),
-      control_fifo(cfg.control_fifo_depth),
-      imu("imu_source", cfg, telemetry),
-      gps("gps_source", cfg, telemetry),
-      fusion("fusion_block", cfg, telemetry),
-      control("control_block", cfg, telemetry),
-      plant("plant_block", cfg, telemetry) {
+      scfg(s), pcfg(p),
+      imu_fifo(s.imu_fifo_depth),
+      enc_fifo(s.encoder_fifo_depth),
+      control_fifo(s.control_fifo_depth),
+      disturbance_fifo(s.disturbance_fifo_depth),
+      plant("plant", s, p),
+      imu("imu", s, p, plant.get_state()),
+      encoder("encoder", s, plant.get_state()),
+      fusion_ctrl("fusion_ctrl", s, p, plant.get_state()),
+      disturbance("disturbance", s, p)
+{
     imu.out(imu_fifo);
-    gps.out(gps_fifo);
+    encoder.out(enc_fifo);
 
-    fusion.imu_in(imu_fifo);
-    fusion.gps_in(gps_fifo);
-    fusion.out(fusion_fifo);
+    fusion_ctrl.imu_in(imu_fifo);
+    fusion_ctrl.enc_in(enc_fifo);
+    fusion_ctrl.out(control_fifo);
 
-    control.in(fusion_fifo);
-    control.out(control_fifo);
+    plant.control_in(control_fifo);
+    plant.disturbance_in(disturbance_fifo);
 
-    plant.in(control_fifo);
-
-    telemetry.log_fifo_occupancy("imu_fifo", SC_ZERO_TIME, 0);
-    telemetry.log_fifo_occupancy("gps_fifo", SC_ZERO_TIME, 0);
-    telemetry.log_fifo_occupancy("fusion_fifo", SC_ZERO_TIME, 0);
-    telemetry.log_fifo_occupancy("control_fifo", SC_ZERO_TIME, 0);
+    disturbance.out(disturbance_fifo);
 }
