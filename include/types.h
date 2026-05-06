@@ -38,10 +38,15 @@ struct EncoderSample {
 };
 
 // ── Control command (force on cart in Newtons) ────────────────────────────
+// Carries the timestamps of the IMU and encoder samples that produced it,
+// so downstream consumers (Plant, Telemetry, post-processing) can compute
+// end-to-end sensing-to-command latency without ambiguity.
 struct ControlCommand {
     std::uint64_t seq = 0;
     double force      = 0.0;
-    sc_core::sc_time timestamp = sc_core::SC_ZERO_TIME;
+    sc_core::sc_time timestamp     = sc_core::SC_ZERO_TIME;  // when cmd was emitted (post-compute)
+    sc_core::sc_time imu_timestamp = sc_core::SC_ZERO_TIME;  // emit-time of latest IMU sample used
+    sc_core::sc_time enc_timestamp = sc_core::SC_ZERO_TIME;  // emit-time of latest encoder sample used
     bool valid = false;
 };
 
