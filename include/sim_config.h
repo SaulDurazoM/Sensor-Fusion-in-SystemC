@@ -10,6 +10,13 @@ struct SimConfig {
 
     sc_core::sc_time simulation_duration = sc_core::sc_time(20, sc_core::SC_SEC);
 
+    // Master RNG seed. Each module derives its actual seed from this value so
+    // every random draw in the simulation can be reproduced (or, with a
+    // different seed, re-drawn for Monte-Carlo studies of the timing model).
+    // Set via 5th CLI argument; defaults to 42 for backwards compatibility
+    // with the old hardcoded seeds.
+    unsigned int seed = 42;
+
     // ── Timing ────────────────────────────────────────────────────────────
     sc_core::sc_time plant_dt       = sc_core::sc_time(500, sc_core::SC_US);  // 2 kHz RK4
     sc_core::sc_time imu_period     = sc_core::sc_time(1,   sc_core::SC_MS);  // 1 kHz
@@ -48,6 +55,13 @@ struct SimConfig {
     double force_decay_threshold = 1.0;    // N — |F| below this triggers bleed
 
     double force_saturation = 30.0;        // N
+
+    // ── Fall detection ────────────────────────────────────────────────────
+    // Plant marks the run as "fallen" if |θ| stays above fall_threshold_rad
+    // for at least fall_dwell_s contiguous seconds. 0.6 rad ≈ 34°, well past
+    // any recoverable excursion under the cascade controller.
+    double fall_threshold_rad = 0.6;
+    double fall_dwell_s       = 0.05;
 
     // ── Complementary filter time constants ──────────────────────────────
     // alpha is derived each tick as tau/(tau+dt) so bandwidth is dt-invariant.
@@ -130,6 +144,27 @@ struct SimConfig {
         cfg.imu_fifo_depth     = 4;   // was 16
         cfg.encoder_fifo_depth = 4;   // was 16
         cfg.control_fifo_depth = 4;   // was 16
+
+        return cfg;
+    }
+
+    // Parametric stress: scale FusionControl compute distributions by k
+    // relative to the baseline stress() configuration. Plant and sensor
+    // compute are NOT scaled — the plant represents physical dynamics
+    // (which don't slow down when an MCU is busy) and the sensors are
+    // hardware that runs independently of the controller. Only the FC
+    // is "the embedded firmware" whose compute budget we're studying.
+    static SimConfig stress_factor(double k) {
+        SimConfig cfg = SimConfig::stress();
+        cfg.case_name = "stress_k" + std::to_string(k);
+
+        cfg.fc_compute_mean_us    *= k;
+        cfg.fc_compute_std_us     *= k;
+        cfg.fc_disturbed_mean_us  *= k;
+        cfg.fc_disturbed_std_us   *= k;
+        // plant_compute_*  unchanged — physical dynamics don't slow down
+        // imu_compute_*    unchanged — sensor hardware runs independently
+        // enc_compute_*    unchanged — sensor hardware runs independently
 
         return cfg;
     }

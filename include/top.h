@@ -33,7 +33,7 @@ private:
     PhysicsConfig pcfg_;
     const PlantState* state_;
     std::uint64_t seq_ = 0;
-    std::mt19937  rng_{ 42 };
+    std::mt19937  rng_;
     std::normal_distribution<double> gyro_noise_;
     std::normal_distribution<double> accel_noise_;
     std::normal_distribution<double> compute_dist_;
@@ -59,7 +59,7 @@ private:
     SimConfig     scfg_;
     const PlantState* state_;
     std::uint64_t seq_ = 0;
-    std::mt19937  rng_{ 99 };
+    std::mt19937  rng_;
     std::normal_distribution<double> compute_dist_;
     std::ofstream csv_;
 };
@@ -87,7 +87,7 @@ private:
     SimConfig     scfg_;
     PhysicsConfig pcfg_;
     std::uint64_t seq_ = 0;
-    std::mt19937  rng_{ 7 };
+    std::mt19937  rng_;
     std::normal_distribution<double> compute_normal_dist_;
     std::normal_distribution<double> compute_disturbed_dist_;
 
@@ -140,6 +140,12 @@ public:
     std::uint64_t deadline_misses_ = 0;
     std::uint64_t cmds_consumed_   = 0;
 
+    // Fall detection — set true once |θ| has exceeded fall_threshold_rad
+    // continuously for fall_dwell_s. Read by Telemetry::end_of_simulation().
+    bool             fell_      = false;
+    sc_core::sc_time fall_time_ = sc_core::SC_ZERO_TIME;
+    double           theta_max_abs_ = 0.0;
+
     SC_HAS_PROCESS(Plant);
     Plant(sc_core::sc_module_name name,
           const SimConfig& scfg, const PhysicsConfig& pcfg);
@@ -152,11 +158,15 @@ public:
 private:
     SimConfig     scfg_;
     PhysicsConfig pcfg_;
-    std::mt19937  rng_{ 13 };
+    std::mt19937  rng_;
     std::normal_distribution<double> compute_dist_;
 
     PlantState state_;
     double current_force_ = 0.0;
+
+    // Fall-detection helper: dwell timer integrating contiguous time spent
+    // above the fall threshold. Reset to zero whenever |θ| drops back inside.
+    sc_core::sc_time fall_dwell_acc_ = sc_core::SC_ZERO_TIME;
 
     std::ofstream csv_;
 

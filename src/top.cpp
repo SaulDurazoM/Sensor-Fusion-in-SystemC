@@ -19,6 +19,7 @@ IMUSensor::IMUSensor(sc_module_name name,
       accel_noise_(0.0, scfg.accel_noise_std),
       compute_dist_(scfg.imu_compute_mean_us, scfg.imu_compute_std_us)
 {
+    rng_.seed(scfg.seed + 1);
     const std::string dir  = scfg_.output_dir + "/" + scfg_.case_name;
     const std::string path = dir + "/imu.csv";
     std::filesystem::create_directories(dir);
@@ -88,6 +89,7 @@ EncoderSensor::EncoderSensor(sc_module_name name,
     : sc_module(name), scfg_(scfg), state_(state),
       compute_dist_(scfg.enc_compute_mean_us, scfg.enc_compute_std_us)
 {
+    rng_.seed(scfg.seed + 2);
     const std::string dir  = scfg_.output_dir + "/" + scfg_.case_name;
     const std::string path = dir + "/encoder.csv";
     std::filesystem::create_directories(dir);
@@ -142,6 +144,8 @@ FusionControl::FusionControl(sc_module_name name,
       compute_disturbed_dist_(scfg.fc_disturbed_mean_us, scfg.fc_disturbed_std_us),
       state_(state)
 {
+    rng_.seed(scfg.seed + 3);
+
     // Smoother startup for the accelerometer EMA: a_y starts near g so the
     // first few atan2(a_x, a_y) calls are well-conditioned.
     a_y_corrected = pcfg.g;
@@ -400,6 +404,8 @@ Plant::Plant(sc_module_name name,
     : sc_module(name), scfg_(scfg), pcfg_(pcfg),
       compute_dist_(scfg.plant_compute_mean_us, scfg.plant_compute_std_us)
 {
+    rng_.seed(scfg.seed + 4);
+
     state_.theta     = pcfg_.theta_0;
     state_.theta_dot = pcfg_.theta_dot_0;
     state_.z         = pcfg_.z_0;
@@ -546,6 +552,24 @@ void Plant::run()
         state_.theta_ddot = dxn[1];
         state_.z_ddot     = dxn[3];
 
+        // ── Fall detection ────────────────────────────────────────────────
+        // Track peak |θ| and the contiguous dwell time above the threshold.
+        // First time the dwell exceeds fall_dwell_s, latch fell_=true and
+        // record the moment fall_time_. We do NOT stop the simulation; the
+        // run continues so post-fall dynamics can be inspected, but the
+        // latched flags propagate to summary.csv via Telemetry.
+        const double abs_theta = std::abs(state_.theta);
+        if (abs_theta > theta_max_abs_) theta_max_abs_ = abs_theta;
+        if (abs_theta > scfg_.fall_threshold_rad) {
+            fall_dwell_acc_ += scfg_.plant_dt;
+            if (!fell_ && fall_dwell_acc_.to_seconds() >= scfg_.fall_dwell_s) {
+                fell_      = true;
+                fall_time_ = sc_time_stamp() - fall_dwell_acc_;
+            }
+        } else {
+            fall_dwell_acc_ = sc_core::SC_ZERO_TIME;
+        }
+
         write_csv_row(sc_time_stamp().to_seconds());
     }
 }
@@ -667,6 +691,11 @@ void Telemetry::end_of_simulation()
     sum << "fc_deadline_misses," << fc_mod_->deadline_misses_   << "\n";
     sum << "plant_cmds_consumed,"<< plant_mod_->cmds_consumed_  << "\n";
     sum << "plant_deadline_misses," << plant_mod_->deadline_misses_ << "\n";
+    sum << "fell,"               << (plant_mod_->fell_ ? 1 : 0) << "\n";
+    sum << "fall_time_s,"        << (plant_mod_->fell_
+                                     ? plant_mod_->fall_time_.to_seconds()
+                                     : -1.0) << "\n";
+    sum << "theta_max_abs,"      << plant_mod_->theta_max_abs_ << "\n";
 
     std::cout << "\n=== Telemetry summary (" << scfg_.case_name << ") ===\n"
               << "  IMU:   emitted=" << imu_mod_->emitted_ << "  drops=" << imu_mod_->drops_ << "\n"
@@ -674,7 +703,12 @@ void Telemetry::end_of_simulation()
               << "  FC:    emitted=" << fc_mod_->emitted_  << "  drops=" << fc_mod_->drops_
               << "  deadline_misses=" << fc_mod_->deadline_misses_ << "\n"
               << "  PLANT: consumed=" << plant_mod_->cmds_consumed_
-              << "  deadline_misses=" << plant_mod_->deadline_misses_ << "\n";
+              << "  deadline_misses=" << plant_mod_->deadline_misses_ << "\n"
+              << "  FALL:  fell=" << (plant_mod_->fell_ ? "YES" : "no")
+              << "  fall_time_s=" << (plant_mod_->fell_
+                                      ? plant_mod_->fall_time_.to_seconds()
+                                      : -1.0)
+              << "  max|theta|=" << plant_mod_->theta_max_abs_ << " rad\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
