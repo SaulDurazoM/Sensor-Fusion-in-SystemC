@@ -99,6 +99,32 @@ extension — the `.devcontainer/` config wraps the same image used by
 `docker compose`, so the rest of this section applies inside that environment
 too (skip the `docker compose run` prefix on every command).
 
+### Host shell prerequisites
+
+The commands in this README assume a POSIX shell — Linux, macOS, or Windows
+via WSL or Git Bash. The pattern `--user "$(id -u):$(id -g)"` appears
+throughout and exists so that files written into the bind-mounted workspace
+(the `build-docker/` and `results/` directories) come back owned by your
+host user instead of by root inside the container.
+
+On native Windows (PowerShell or cmd), `id` is not a command and the
+substitution will fail — PowerShell raises `CommandNotFoundException`, and
+even when the error is silently swallowed Docker is handed a malformed
+`--user :`. Two options:
+
+- **Recommended on Windows:** open the project root in Git Bash or a WSL
+  terminal and run the commands as-is.
+- **Otherwise:** drop the `--user "$(id -u):$(id -g)"` flag from every
+  invocation. Docker Desktop on Windows mediates bind-mount ownership
+  through its own translation layer, so files end up owned by your Windows
+  user without that flag. The same shortcut on a Linux host leaves build
+  artefacts owned by root and forces `sudo` to clean them up — which is why
+  the `--user` form is the canonical one in the examples below.
+
+The `.devcontainer/` workflow described above sidesteps this entirely: VS
+Code handles user mapping itself and you never type `docker compose run`
+directly.
+
 ### 1. Build the image
 
 ```bash
@@ -116,9 +142,6 @@ cmake -S . -B build-docker &&
 cmake --build build-docker -j
 '
 ```
-
-The `--user` flag makes any files written into the bind-mounted workspace
-(build artefacts, `results/`) owned by your host user rather than root.
 
 ### 3. Run the simulation
 
